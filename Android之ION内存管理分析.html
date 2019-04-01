@@ -1,0 +1,628 @@
+ 备注：图片中的双向箭头表示他们是链表，前后链接起来的，单向箭头表示指针指向谁。
+
+　　做Camera都快2年了，对buffer流转,buffer queue 等一些细节方面，还是不太明白。虽然也知道怎么用，但是不知道更深层次的工作机制，内心有点忐忑不安。所以决定拿一个周末好好研究了一下ION。下面就对这个周末先做个笔记吧，如果你发现其中有错误，欢迎指正出来，大家一起共同进步，学习。
+
+    ION是google在Android4.0 为了解决内存碎片管理而引入的通用内存管理器,在面向程序员编程方面，它和ashmem很相似。但是终究还是ION更胜一筹。
+
+一、ION常用的数据结构
+
+<1>struct ion_allocation_data
+
+一般开发平台上都会有一个ion封装库，我们在开发时，只需要知道怎么调用接口申请到buffer就行了。同其它设备驱动一样，ion 设备驱动具有open，close，ioctl等标准系统调用。我们在使用ioctl(fd, ION_IOC_ALLOC, &data)申请buffer时，都需要传入一个struct ion_allocation_data的结构体。如下所示：
+
+/**
+ * struct ion_allocation_data - metadata passed from userspace for allocations
+ * @len:		size of the allocation
+ * @align:		required alignment of the allocation
+ * @heap_id_mask:	mask of heap ids to allocate from
+ * @flags:		flags passed to heap
+ * @handle:		pointer that will be populated with a cookie to use to 
+ *			refer to this allocation
+ *
+ * Provided by userspace as an argument to the ioctl
+ */
+struct ion_allocation_data {
+	size_t len;
+	size_t align;
+	unsigned int heap_id_mask;
+	unsigned int flags;
+	ion_user_handle_t handle;
+};
+len:我们要申请的内存大小，是页对齐的，如果应用层没有做页对齐，那么在内核driver里面也会做页对齐的。
+align:对齐标示，如上所示，一般都是页对齐（4K）
+
+heap_id_mask:用这个来标示我们要在哪个heap上申请buffer
+
+flags:这个就是我们传入的一些标志位，包括我们要在哪个heap 上申请buffer和是否使用cache。
+
+handle：保存buffer的句柄(ion_handle)，其实就是一个整型值。这个值还不进程间共享，只能当前进程访问。因为这是一个虚拟地址。
+
+这个结构体是用来申请buffer是传感kernel的一些配置参数，并将申请成功的buffer的handle，存放到handle域，其实这里ion_user_handle_t 是一个整型变量。
+
+typedef int ion_user_handle_t;
+<2>struct ion_fd_data
+
+/**
+ * struct ion_fd_data - metadata passed to/from userspace for a handle/fd pair
+ * @handle:	a handle
+ * @fd:		a file descriptor representing that handle
+ *
+ * For ION_IOC_SHARE or ION_IOC_MAP userspace populates the handle field with
+ * the handle returned from ion alloc, and the kernel returns the file
+ * descriptor to share or map in the fd field.  For ION_IOC_IMPORT, userspace
+ * provides the file descriptor and the kernel returns the handle.
+ */
+struct ion_fd_data {
+	ion_user_handle_t handle;
+	int fd;
+};
+handle：指向这个buffer的ion_handle，当前进程可以使用这个访问buffer
+
+fd：当我们想共享这个buffer时，使用ION_IOC_SHARE kernel就会给我们返回一个唯一标识这个buffer的fd，并保存到fd域中，具体使用场景，后面我们会介绍。
+
+<3>struct ion_handle_data
+
+这个其实就是记录当前buffer的句柄的结构体，只不过又封装了一下，如名字就知道是提供给user的。
+
+/**
+ * struct ion_handle_data - a handle passed to/from the kernel
+ * @handle:	a handle
+ */
+struct ion_handle_data {
+	ion_user_handle_t handle;
+};
+handle:当前进程中表示这个buffer的句柄
+
+<4>struct on_device
+
+/**
+ * struct ion_device - the metadata of the ion device node
+ * @dev:		the actual misc device
+ * @buffers:		an rb tree of all the existing buffers
+ * @buffer_lock:	lock protecting the tree of buffers
+ * @lock:		rwsem protecting the tree of heaps and clients
+ * @heaps:		list of all the heaps in the system
+ * @user_clients:	list of all the clients created from userspace
+ */
+struct ion_device {
+	struct miscdevice dev;
+	struct rb_root buffers;
+	struct mutex buffer_lock;
+	struct rw_semaphore lock;
+	struct plist_head heaps;
+	long (*custom_ioctl) (struct ion_client *client, unsigned int cmd,
+			      unsigned long arg);
+	struct rb_root clients;
+	struct dentry *debug_root;
+};
+上面里面有很多熟悉的面孔，我们就挑几个比较重要的来解释一下
+buffers:用来记录用户申请的所有ion_buffer的红黑树。
+
+heaps:ion设备创建的内存堆，这个可以由用户自定义，我在开发过程中，他们喜欢给一些设备reserer一些buffer，已保证物理地址连续
+
+clients:内核创建的所有ion_client对象都会链接到这个红黑树上
+
+<5>struct ion_client
+
+每一个申请buffer的进程都会有至少包含一个ion_client对象。它表示的就是buffer的使用者。
+/**
+ * struct ion_client - a process/hw block local address space
+ * @node:		node in the tree of all clients
+ * @dev:		backpointer to ion device
+ * @handles:		an rb tree of all the handles in this client
+ * @idr:		an idr space for allocating handle ids
+ * @lock:		lock protecting the tree of handles
+ * @name:		used for debugging
+ * @task:		used for debugging
+ *
+ * A client represents a list of buffers this client may access.
+ * The mutex stored here is used to protect both handles tree
+ * as well as the handles themselves, and should be held while modifying either.
+ */
+struct ion_client {
+	struct rb_node node;
+	struct ion_device *dev;
+	struct rb_root handles;
+	struct idr idr;
+	struct mutex lock;
+	const char *name;
+	struct task_struct *task;
+	pid_t pid;
+	struct dentry *debug_root;
+};
+node:用来将当前ion_client,链接进ion_dev client红黑树中的node。可以参考上面ion_device结构体。
+
+handles: 当前client申请的ion_buffer红黑树
+
+idr:有idr空间分配的唯一标识这个client的id
+
+name：ion_client的名字，一般是进程id加上是当前进程第几个client的序列号，即$(process_id) + num
+
+taksk:当前进程的任务控制块
+
+pid:进程的进程id
+
+<6>struct ion_handle
+
+我们申请到的buffer就是用这个结构体表示的。
+
+/**
+ * ion_handle - a client local reference to a buffer
+ * @ref:		reference count
+ * @client:		back pointer to the client the buffer resides in
+ * @buffer:		pointer to the buffer
+ * @node:		node in the client's handle rbtree
+ * @kmap_cnt:		count of times this client has mapped to kernel
+ * @id:			client-unique id allocated by client->idr
+ *
+ * Modifications to node, map_cnt or mapping should be protected by the
+ * lock in the client.  Other fields are never changed after initialization.
+ */
+struct ion_handle {
+	struct kref ref;
+	struct ion_client *client;
+	struct ion_buffer *buffer;
+	struct rb_node node;
+	unsigned int kmap_cnt;
+	int id;
+};
+是用来存放buffer的，从结构体中，我们可以发现有buffer的使用者和buffer的指针，还有一个一个非常关键的
+
+ref：当前ion_buffer引用计数
+
+client:当前ion_buffer属于哪个client所有
+
+buffer:指向buffer内存块的地址
+
+id：唯一表示ion_buffer的整型变量，通过内核的idr机制加上这个id就可以在其它进程中访问到这块buffer。而且上层在传下来的struct ion_allocation_data结构体中也只是保存了这个id。
+
+二、进程、client、buffer的关系
+
+阅读kernel的ion设备驱动时，你会发现进程、ion_client、buffer他们三个的关系还是比较"乱"的。在ion设备结构体中有ion_client,ion_buffer,ion_heap红黑树。它会把系统中所有的ion_client,ion_buffer,ion_heap串联起来。如下所示的结构。
+
+
+
+在内核中默认会创建下面几种heap，其中用的最多要属于system heap和carveout heap(名字可以自己定义的)
+
+system heap：分配的物理页面可能是离散的，只是虚拟地址连续而已。
+
+carveout heap：分配的物理页面是连续的，因为这些内存是提前预留的。
+
+kernel刚起来的时，会根据解析设备树，找到ion设备节点的配置，然后依次找到各个heap的id，type，地址区间，其中system heap地址区间是没有数据的。但是我所看的三星4418的代码不是使用dts方式，而是直接在头文件中配置的，如下所示，其中最后的nxp_device_ion变量是全局的，对ion设备是可见的，ion设备probe创建各种heap时就会直接拿过来用了。
+
+void __init nxp_ion_set_platdata(void)
+{
+    struct ion_platform_data *pdata;
+    pdata = kzalloc(sizeof(struct ion_platform_data), GFP_KERNEL);
+    pdata->heaps = kzalloc(5 * sizeof(struct ion_platform_heap), GFP_KERNEL);
+ 
+    if (pdata) {
+        pdata->nr = 3;
+        pdata->heaps[0].type = ION_HEAP_TYPE_SYSTEM;
+        pdata->heaps[0].name = "ion_noncontig_heap";
+        pdata->heaps[0].id   = ION_HEAP_TYPE_SYSTEM;
+        pdata->heaps[1].type = ION_HEAP_TYPE_SYSTEM_CONTIG;
+        pdata->heaps[1].name = "ion_contig_heap";
+        pdata->heaps[1].id   = ION_HEAP_TYPE_SYSTEM_CONTIG;
+        pdata->heaps[2].type = ION_HEAP_TYPE_NXP_CONTIG;
+        pdata->heaps[2].name = "nxp_contig_heap";
+        pdata->heaps[2].id   = ION_HEAP_TYPE_NXP_CONTIG;
+        nxp_device_ion.dev.platform_data = pdata;
+    }
+}
+下面就是nexell写的针对三星4418的平台ion设备驱动，下面省略号都是一些检查指针有效性的代码，这里为了代码看起来简洁，就删掉了。这里只是介绍一下大概的流程，如果你想深入研究的话，可以查阅源代码。
+static int nxp_ion_probe(struct platform_device *pdev)
+{
+    struct ion_platform_data *pdata = pdev->dev.platform_data; //上面的代码可以看到这个平台数据在kernel起来的最初期，已经设置过了。
+    int error;
+    int i;
+    struct ion_device *ion_dev;
+    struct ion_heap **heaps;
+    ........
+    ion_dev = ion_device_create(nxp_ion_custom_ioctl); //设置/dev/ion设备，并将客户nexell的ionctl注册到ion core。
+    ........
+    heaps = kzalloc(sizeof(struct ion_heap *) * pdata->nr, GFP_KERNEL);
+    .......
+    for (i = 0; i < pdata->nr; i++) {
+        struct ion_platform_heap *heap_data = &pdata->heaps[i];
+ 
+        heaps[i] = _ion_heap_create(heap_data); //这里会创建各种heap,我们就不细说了。
+        .......
+    }
+ 
+    s_num_heaps     = pdata->nr;
+    s_heaps         = heaps;
+    g_ion_nxp       = ion_dev;
+    s_nxp_ion_dev   = &pdev->dev;
+ 
+    platform_set_drvdata(pdev, g_ion_nxp);
+ 
+    printk("%s success!!!\n", __func__);
+    return 0;
+    .......
+    return error;
+}
+系统各种heap创建的过程中，会给每一个heap分配一个内存池，这里我们已system_heap为例子来说一下。他们分被是64K，16K,1K的内存池，其中每一个pool都包含了高地址和低地址的双向链表。
+static const unsigned int orders[] = {8, 4, 0};
+static const int num_orders = ARRAY_SIZE(orders);
+下面是创建内存池的函数，系统在第一次创建时，pool各个域都是初始值。因为system heap本来就是系统随机分配的，只有在ion buffer释放时，才会将对应的物理页放到对应的pool中，这样的话下次系统分配ion buffer时，不需要从系统那边申请了，直接在pool中查找是否有合适的buffer，有的话，直接就拿过来用了，没有的话才会从系统那边在申请。
+struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order)
+{
+	struct ion_page_pool *pool = kmalloc(sizeof(struct ion_page_pool),
+					     GFP_KERNEL);
+	if (!pool)
+		return NULL;
+	pool->high_count = 0;
+	pool->low_count = 0;
+	INIT_LIST_HEAD(&pool->low_items);//低地址链表
+	INIT_LIST_HEAD(&pool->high_items);//高地址链表
+	pool->gfp_mask = gfp_mask;
+	pool->order = order; //order分别是对应的大小等级，即8,4,0
+	mutex_init(&pool->mutex);
+	plist_node_init(&pool->list, order);
+ 
+	return pool;
+}
+系统中各种heap和pool的如下所示，值得我们注意的是system heap有3个pool，cma_heap没有pool，carveout_heap,chunk_heap只有一条pool，其中用的最多的就是system_heap和chunk_heap.
+
+
+接下来我们了解一下ion_client和buffer的关系。当我们打开ion设备时，会创建一个ion_client对象。如下代码中所见的那样,至于内部如何创建的，这里我们就不介绍了。
+
+static int ion_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+	struct ion_device *dev = container_of(miscdev, struct ion_device, dev);
+	struct ion_client *client;
+ 
+	pr_debug("%s: %d\n", __func__, __LINE__);
+	client = ion_client_create(dev, "user");//创建ion_client
+	if (IS_ERR(client))
+		return PTR_ERR(client);
+	file->private_data = client;
+ 
+	return 0;
+}
+进程，ion_client,buffer的组织结构如下图这样。进程之间共享buffer时，也是通过binder机制将共享ion_buffer发送给对应的进程，然后对应的进程在根据这个fd将该块buffer映射进自己的进程中。
+
+
+
+验证效果：
+
+下面是在公司手机上抓的log，最后一侧都是ion_client的名字，其中最后一个字段中，前半部是进程id，后面的序号是当前第几个此打开的ion设备。
+
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1265-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1265-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1299-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1299-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-2
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-3
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-4
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 734-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 883-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 883-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 906-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 906-1
+用ps命令可以看到cameraserver进程，android7.0上camera已经从mediaserver进程中独立出一个cameraserver进程，注意下面cameraserver进程id是258
+root         256   1     1005760 65120 poll_sched acd51634 S zygote
+audioserver  257   1     32436  6336  binder_thr ac6ed58c S /system/bin/audioserver
+cameraserver 258   1     52468  6160  binder_thr b5b6658c S /system/bin/cameraserver
+drm          259   1     42844  11348 binder_thr b55d858c S /system/bin/drmserver
+这里我打开了camera后，发现多了很多ion_client,其中258开始的ion_client有15块。
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1265-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1265-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1299-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 1299-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 1844-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 1844-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-2
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-3
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 208-4
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-2
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-3
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-4
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-5
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-6
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-7
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-8
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-9
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-10
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-11
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-12
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-13
+-rw-rw-r-- 1 root root 0 2012-01-01 08:03 258-14 
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 734-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 883-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 883-1
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 906-0
+-rw-rw-r-- 1 root root 0 2012-01-01 08:01 906-1
+三、ION buffer分配及共享
+
+1.申请buffer(ION_OPEN)
+
+buffer申请步骤还是很简单的，申请一个ion_buffer，然后申请ion_handle来盛放ion_buffer.
+
+struct ion_handle *ion_alloc(struct ion_client *client, size_t len,
+			     size_t align, unsigned int heap_id_mask,
+			     unsigned int flags)
+{
+	struct ion_handle *handle;
+	struct ion_device *dev = client->dev;
+	struct ion_buffer *buffer = NULL;
+	struct ion_heap *heap;
+	int ret;
+        ..........
+        ............
+        len = PAGE_ALIGN(len);//申请大小要对齐
+ 
+	down_read(&dev->lock);
+	plist_for_each_entry(heap, &dev->heaps, node) {//根据flag标志位，判断从哪一个heap分配buffer
+		/* if the caller didn't specify this heap id */
+		if (!((1 << heap->id) & heap_id_mask))
+			continue;
+		buffer = ion_buffer_create(heap, dev, len, align, flags);//找到对应的heap就开始从heap分配buffer
+		if (!IS_ERR(buffer))
+			break;
+	}
+	up_read(&dev->lock);
+        ..........
+ 
+	handle = ion_handle_create(client, buffer);//创建ion_handle,保存client，buffer各种指针
+ 
+	/*
+	 * ion_buffer_create will create a buffer with a ref_cnt of 1,
+	 * and ion_handle_create will take a second reference, drop one here
+	 */
+	ion_buffer_put(buffer);
+        ......
+	mutex_lock(&client->lock);
+	ret = ion_handle_add(client, handle);//将创建的ion_handle加入到client的红黑树中
+	mutex_unlock(&client->lock);
+	if (ret) {
+		ion_handle_put(handle);
+		handle = ERR_PTR(ret);
+	}
+ 
+	return handle;
+下面是申请buffer的实现细节，其中我删除一些我们不必了解的代码，如果想了解的话，可自行研究源码。
+static struct ion_buffer *ion_buffer_create(struct ion_heap *heap,
+				     struct ion_device *dev,
+				     unsigned long len,
+				     unsigned long align,
+				     unsigned long flags)
+{
+	struct ion_buffer *buffer;
+	struct sg_table *table;
+	struct scatterlist *sg;
+	struct timeval time;
+	int i, ret;
+ 
+	buffer = kzalloc(sizeof(struct ion_buffer), GFP_KERNEL);
+	if (!buffer)
+		return ERR_PTR(-ENOMEM);
+ 
+	buffer->heap = heap;//buffer是从哪个heap分配的buffer
+	buffer->flags = flags; //申请buffer时，用的flag，这一flag标志buffer从哪个heap分配
+	kref_init(&buffer->ref); //引用技术器初始化
+ 
+	if (heap->flags & ION_HEAP_FLAG_DEFER_FREE) {
+	   bool cached = ion_buffer_cached(buffer);
+	   ion_heap_freelist_drain(heap, cached, len);
+	}
+	ret = heap->ops->allocate(heap, buffer, len, align, flags); //这里已system_heap为例，下面清看代码
+	if (ret) {
+	    if (!(heap->flags & ION_HEAP_FLAG_DEFER_FREE))
+	    goto err2;
+ 
+           ion_heap_freelist_drain(heap, -1, 0);
+           ret = heap->ops->allocate(heap, buffer, len, align,
+					   flags);
+           if (ret)
+	       goto err2;
+	}
+ 
+	buffer->dev = dev;
+	buffer->size = len;
+        .....
+	ion_buffer_add(dev, buffer);//将上面申请的buffer添加到ion_client的buffer链表中
+	mutex_unlock(&dev->buffer_lock);
+        ......
+}
+下面这段代码才是真正申请buffer的函数，之前我们已经介绍过了system_heap存在3种poll，256k，16k，1k的，所以这里为了能将申请的buffer链接到对应poll上，系统在申请buffer时，也是按着这些大小一次一次的分配的，并将他们用链表连接起来。例如加入我们申请1M内存，它会分配1M/256K=4个，这4个琐碎的buffer，在释放buffer时都会放到256k大小的那个poll上。
+
+static int ion_system_heap_allocate(struct ion_heap *heap,
+				     struct ion_buffer *buffer,
+				     unsigned long size, unsigned long align,
+				     unsigned long flags)
+{
+	struct ion_system_heap *sys_heap = container_of(heap,
+							struct ion_system_heap,
+							heap);
+	struct sg_table *table;
+	struct scatterlist *sg;
+	int ret;
+	struct list_head pages;
+	struct page_info *info, *tmp_info;
+	int i = 0;
+	long size_remaining = PAGE_ALIGN(size);//将申请的buffer大小页对齐。
+	unsigned int max_order = orders[0];    //注意max_order = 8 ；
+ 
+	INIT_LIST_HEAD(&pages);
+	while (size_remaining > 0) {
+		info = alloc_largest_available(sys_heap, buffer, size_remaining, max_order);//每次申请最大的内存，
+		 if (!info)                                                                 //申请的优先级256K->16K->1K
+                    goto err;
+		 list_add_tail(&info->list, &pages);//每次申请到的page首地址都会添加到info->list链表中
+		 size_remaining -= (1 << info->order) * PAGE_SIZE; //注意这里
+		 max_order = info->order;//重新分配大小权值，
+		 i++;
+	 }
+ 
+	 table = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+	 if (!table)
+		goto err;
+ 
+        //......省去一些我们不必了解的，具体清参考源码
+ 
+	return -ENOMEM;
+}
+
+分配buffer时，先分配大块开始分配，例如我们想分配１Ｍ的内存，那么１Ｍ/256 = 4块。那么如果我们想分配１Ｍ+16K的空间，那么就分配４块２５６Ｋ和１块１６Ｋ的就行了。下面我们来见见ａlloc_largest_available（）的真面目。
+static struct page_info *alloc_largest_available(struct ion_system_heap *heap,
+						 struct ion_buffer *buffer,
+						 unsigned long size,
+						 unsigned int max_order)
+{
+	struct page *page;
+	struct page_info *info;
+	int i;
+ 
+	for (i = 0; i < num_orders; i++) { //num_orders = 3 分别是8，4，0
+		if (size < order_to_size(orders[i]))//申请的size小于当前权值对应的mem_size,就会对比第二权值
+			continue;
+		if (max_order < orders[i])
+			continue;
+ 
+		page = alloc_buffer_page(heap, buffer, orders[i]);//分配物理页面
+		if (!page)
+			continue;
+ 
+		info = kmalloc(sizeof(struct page_info), GFP_KERNEL);
+		info->page = page;
+		info->order = orders[i];//记录当前使用的权值，供上一级调用处使用。
+		return info;
+	}
+	return NULL;
+}
+开始创建保存ion_buffer的ion_handle，其实它的工作很简单，
+static struct ion_handle *ion_handle_create(struct ion_client *client,
+				     struct ion_buffer *buffer)
+{
+	struct ion_handle *handle;
+ 
+	handle = kzalloc(sizeof(struct ion_handle), GFP_KERNEL);
+	if (!handle)
+		return ERR_PTR(-ENOMEM);
+	kref_init(&handle->ref); //ion_handle的引用计数初始化
+	RB_CLEAR_NODE(&handle->node);
+	handle->client = client;
+	ion_buffer_get(buffer);
+	ion_buffer_add_to_handle(buffer);//这个地方很值得推敲，可以看到一个ion_buffer可以对应多个ion_handle，不知道这样理解正确否。
+	handle->buffer = buffer; //记录ion_buffer
+ 
+	return handle;
+}
+2.buffer共享
+
+在kernel ion driver中可以发现，上层应用通过系统调用将我们想share的ion_handle传下来(其实就是对应idr)，然后通过这个handle找到真正的ion_handle。根据ion_buffer在dma buffer中找到其对应的fd，然后其它进程通过这个fd就可以找到对应的buffer了。
+
+	case ION_IOC_SHARE:
+	case ION_IOC_MAP:
+	{
+		struct ion_fd_data data;
+		struct ion_handle *handle;
+ 
+		if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+			return -EFAULT;
+		handle = ion_uhandle_get(client, (int)data.handle);//根据之前保存的id，找到对应的ion_handle
+		data.fd = ion_share_dma_buf_fd(client, handle);//在dma buffer中查找buffer，并返回buffer的唯一fd
+		if (copy_to_user((void __user *)arg, &data, sizeof(data)))
+			return -EFAULT;
+		if (data.fd < 0)
+			return data.fd;
+		break;
+	}
+四、Debug方法
+
+在/sys/kernel/debug/ion/ 目录下有Ｉｏｎ调试文件。可以通过这个地方，来查看自己申请的那个ｂｕｆｆｅｒ有没有创建成功。现在手上有ｎａｎｏｐｉ２ 的开发板，我们进去看看。能够发现nxp_contig_heap,当然这个heap 的名字可以每个平台都不一样。
+
+root@nanopi2:/sys/kernel/debug/ion # ls -l
+-rw-rw-r-- root     root            0 1970-01-01 00:00 1
+-rw-rw-r-- root     root            0 2016-01-01 08:06 107
+-rw-rw-r-- root     root            0 2016-01-01 08:06 339
+-rw-rw-r-- root     root            0 2016-01-01 08:07 504
+-rw-rw-r-- root     root            0 1970-01-01 00:00 ion_contig_heap
+-rw-rw-r-- root     root            0 1970-01-01 00:00 ion_noncontig_heap
+-rw-rw-r-- root     root            0 1970-01-01 00:00 nxp_contig_heap
+root@nanopi2:/sys/kernel/debug/ion # cat ion
+ion_contig_heap     ion_noncontig_heap  
+at ion_contig_heap                                                            <
+          client              pid             size
+----------------------------------------------------
+----------------------------------------------------
+orphaned allocations (info is from last known client):
+----------------------------------------------------
+  total orphaned                0
+          total                 0
+----------------------------------------------------
+root@nanopi2:/sys/kernel/debug/ion # cat nxp_contig_heap
+          client              pid             size
+----------------------------------------------------
+          nxp-fb                1         11059200
+----------------------------------------------------
+orphaned allocations (info is from last known client):
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107          3440640 0 1
+  surfaceflinger              107          3440640 0 1
+  surfaceflinger              107         13836288 0 1
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107          3686400 0 1
+----------------------------------------------------
+  total orphaned         31776768
+          total          42835968
+----------------------------------------------------
+上面是还没打开camera时的状态，可以看到media server 进程还没申请ion buffer打开camera之后就大不一样了。下面可以看到不光mediaserver申请了那么多buffer，而且surfaceflinger进程也申请了很多的buffer，这是由于要显示camera的数据。不过看到nanopi2开发板关掉camera后，mediaserver进程分配的buffer也没有释放，这是他们的bug，我们就管不着了。
+root@nanopi2:/sys/kernel/debug/ion # cat nxp_contig_heap                       
+          client              pid             size
+----------------------------------------------------
+          nxp-fb                1         11059200
+----------------------------------------------------
+orphaned allocations (info is from last known client):
+  surfaceflinger              107           131072 0 1
+     mediaserver              112           466944 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           466944 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           466944 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           118784 0 1
+     mediaserver              112           466944 0 1
+     mediaserver              112           118784 0 1
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107           245760 0 1
+  surfaceflinger              107           245760 0 1
+  surfaceflinger              107           245760 0 1
+  surfaceflinger              107           733184 0 1
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107           131072 0 1
+  surfaceflinger              107         13836288 0 1
+  surfaceflinger              107           245760 0 1
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107           733184 0 1
+  surfaceflinger              107           733184 0 1
+  surfaceflinger              107          3686400 0 1
+  surfaceflinger              107           131072 0 1
+  surfaceflinger              107           733184 0 1
+  surfaceflinger              107           733184 0 1
+  surfaceflinger              107           733184 0 1
+----------------------------------------------------
+  total orphaned         37175296
+          total          48234496
+----------------------------------------------------
+android5.1 camera服务依然还是在media server进程中，下面能够看到mediaserver进程的pid时112，和上面的吻合。
+drm       111   1     23224  3976  ffffffff b6ef9708 S /system/bin/drmserver
+media     112   1     200540 11444 ffffffff b6ec0708 S /system/bin/mediaserver
+install   113   1     9412   684   c05388ec b6f3a29c S /system/bin/installd
+--------------------- 
+作者：armwind 
+来源：CSDN 
+原文：https://blog.csdn.net/armwind/article/details/53454251 
+版权声明：本文为博主原创文章，转载请附上博文链接！
